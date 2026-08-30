@@ -1,5 +1,11 @@
-import type { ContentSource } from './files'
-import { createMatchKey, filterFiles, listFiles, readFile } from './files'
+import type { ContentSource, ReadFileResult } from './files'
+import {
+  createMatchKey,
+  filterFiles,
+  lineMatches,
+  listFiles,
+  readFile,
+} from './files'
 import type {
   CounterConfig,
   CounterSnapshot,
@@ -7,47 +13,78 @@ import type {
   MatchRecord,
 } from './types'
 
+const MAX_READ_CACHE_SIZE = 1000
+
+function createReadCacheKey(source: ContentSource, filePath: string): string {
+  return `${source.kind}:${source.revision ?? 'workspace'}:${filePath}`
+}
+
+async function readCachedContent(
+  source: ContentSource,
+  filePath: string,
+  readCache: Map<string, ReadFileResult>
+): Promise<ReadFileResult> {
+  const cacheKey = createReadCacheKey(source, filePath)
+  const cachedContent = readCache.get(cacheKey)
+  if (cachedContent !== undefined) {
+    return cachedContent
+  }
+
+  const content = await readFile(source, filePath)
+  if (readCache.size < MAX_READ_CACHE_SIZE) {
+    readCache.set(cacheKey, content)
+  }
+  return content
+}
+
+function createReadFailureError(
+  source: ContentSource,
+  filePath: string,
+  error: Error
+): Error {
+  const location =
+    source.kind === 'revision' ? `${source.revision}:${filePath}` : filePath
+  return new Error(`Failed to read ${location}: ${error.message}`, {
+    cause: error,
+  })
+}
+
+function collectMatchesInContent(
+  filePath: string,
+  content: string,
+  matcher: MatcherConfig
+): MatchRecord[] {
+  return content.split(/\r?\n/).flatMap((line, index) =>
+    lineMatches(line, matcher)
+      ? [
+          {
+            path: filePath,
+            line: index + 1,
+            text: line.trim(),
+          },
+        ]
+      : []
+  )
+}
+
 async function countMatcher(
   source: ContentSource,
   matcher: MatcherConfig,
   files: string[],
-  readCache: Map<string, string | null>
+  readCache: Map<string, ReadFileResult>
 ): Promise<MatchRecord[]> {
   const matches: MatchRecord[] = []
 
   for (const filePath of filterFiles(files, matcher)) {
-    const cacheKey = `${source.kind}:${source.revision ?? 'workspace'}:${filePath}`
-    let content = readCache.get(cacheKey)
-    if (content === undefined) {
-      content = await readFile(source, filePath)
-      readCache.set(cacheKey, content)
-    }
-    if (content === null) {
+    const result = await readCachedContent(source, filePath, readCache)
+    if (result.kind === 'unsupported') {
       continue
     }
-
-    for (const [index, line] of content.split(/\r?\n/).entries()) {
-      if (matcher.type === 'contains') {
-        const matched =
-          matcher.case_sensitive === false
-            ? line.toLowerCase().includes(matcher.pattern.toLowerCase())
-            : line.includes(matcher.pattern)
-        if (!matched) {
-          continue
-        }
-      } else {
-        const flags = matcher.case_sensitive === false ? 'iu' : 'u'
-        if (!new RegExp(matcher.pattern, flags).test(line)) {
-          continue
-        }
-      }
-
-      matches.push({
-        path: filePath,
-        line: index + 1,
-        text: line.trim(),
-      })
+    if (result.kind === 'error') {
+      throw createReadFailureError(source, filePath, result.error)
     }
+
+    matches.push(...collectMatchesInContent(filePath, result.content, matcher))
   }
 
   return matches
@@ -58,7 +95,7 @@ export async function countCounter(
   counter: CounterConfig & { label: string }
 ): Promise<CounterSnapshot> {
   const files = await listFiles(source)
-  const readCache = new Map<string, string | null>()
+  const readCache = new Map<string, ReadFileResult>()
   const dedup = new Map<string, MatchRecord>()
 
   for (const matcher of counter.matchers) {

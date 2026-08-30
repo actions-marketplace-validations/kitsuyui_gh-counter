@@ -3,6 +3,7 @@
 [![TODOs](https://raw.githubusercontent.com/kitsuyui/gh-counter/gh-counter-assets/badges/todo.svg)](https://github.com/kitsuyui/gh-counter/blob/gh-counter-assets/reports/todo.md)
 [![@ts-ignore](https://raw.githubusercontent.com/kitsuyui/gh-counter/gh-counter-assets/badges/type-ignore.svg)](https://github.com/kitsuyui/gh-counter/blob/gh-counter-assets/reports/type-ignore.md)
 [![code symbols](https://raw.githubusercontent.com/kitsuyui/gh-counter/gh-counter-assets/badges/code-tag.svg)](https://github.com/kitsuyui/gh-counter/blob/gh-counter-assets/reports/code-tag.md)
+[![Build Size Report](https://raw.githubusercontent.com/kitsuyui/gh-counter/gh-build-size-assets/badges/total.svg)](https://github.com/kitsuyui/gh-counter/blob/gh-build-size-assets/report.md)
 
 <img width="898" height="515" alt="gh-counter-example" src="https://github.com/user-attachments/assets/5b98db5d-5c76-467b-826c-b6da1cccb58a" />
 
@@ -19,6 +20,8 @@ badge assets to a dedicated branch for repository-wide reporting. This
 repository uses `gh-counter` to track its own `TODO`, `@ts-ignore`, and
 symbol-heavy `<code>` markers and publishes the badges above from
 `gh-counter-assets`.
+This repository also tracks its built action artifact size with
+[`gh-build-size`](https://github.com/kitsuyui/gh-build-size).
 
 ## Quick start
 
@@ -93,7 +96,7 @@ publishing is off by default, and labels fall back to counter ids.
 
 | Field | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `version` | No | none | Recommended to set to `1` |
+| `version` | No | none | Recommended to set to `1`; other values are rejected |
 | `default_branch` | No | repository default branch | Usually not needed |
 | `comment.enabled` | No | `true` | Disables PR comment handling when set to `false` |
 | `comment.key` | No | `default` | Use a unique key if the repo runs multiple `gh-counter` jobs |
@@ -166,6 +169,15 @@ one exception for first-time adoption: if a pull request adds
 emits a short bootstrap comment even when no matcher target files are touched
 yet.
 
+When a pull request renames a file, `gh-counter` treats both the old path and
+the new path as potentially relevant to the PR gate. If either path matches a
+counter's `files` glob, that counter is considered active for the PR, and the
+ratchet check applies through the old path as well as the new one. This means
+that a counter can remain commentable even after its tracked file has been
+renamed out of the counter's scope. Pull requests that consist purely of
+renames may still trigger counter checks if the pre-rename path matched a
+counter's file pattern.
+
 ## When to enable publishing
 
 Publishing is the part that turns `gh-counter` from a review tool into a badge
@@ -174,9 +186,10 @@ and reporting tool. When publishing is enabled, the action writes `summary.json`
 existing JSON and badge files to a dedicated branch. That gives you stable raw
 URLs for badges and a rendered GitHub Markdown page for each metric. The report
 graph uses a solid line for the last `publish.graph_days` days and a dotted
-line for older retained measurements. Because this behavior force-updates a
-generated branch, it is opt-in and should be enabled only when you actually want
-repository-level assets.
+line for older retained measurements. `history.json` keeps the most recent 366
+published entries so the generated branch does not grow without bound. Because
+this behavior force-updates a generated branch, it is opt-in and should be
+enabled only when you actually want repository-level assets.
 
 ```yaml
 version: 1
@@ -233,6 +246,20 @@ workflow can upload those files as artifacts or inspect them in later steps.
 The action also exposes the summary path, the full summary JSON, the number of
 failing violations, and the publish branch through action outputs.
 
+The step outputs are:
+
+| Output | Meaning |
+| --- | --- |
+| `summary-path` | Path to the generated summary JSON file. |
+| `summary-json` | Full generated summary JSON as a string. |
+| `violation-count` | Number of counters with failing conditions in the current event scope. |
+| `has-violations` | `true` when any counter violated a failing condition in the current event scope; otherwise `false`. |
+| `publish-branch` | Publish branch used for generated assets. |
+
+For example, a later step can branch on
+`${{ steps.counter.outputs.has-violations }}` or upload
+`${{ steps.counter.outputs.summary-path }}`.
+
 ## Documentation
 
 The README is intentionally focused on adoption and day-one configuration. The
@@ -245,6 +272,21 @@ This repository is intended to be used as a JavaScript action. In practice that
 means `action.yml` stays at the repository root and `dist/` is committed for the
 release tag that users reference. Marketplace publication may also require
 account-level setup on GitHub's side, including agreement and listing metadata.
+
+## Development
+
+Install [lefthook](https://github.com/evilmartians/lefthook) and run the following command once to set up local Git hooks:
+
+```sh
+lefthook install
+```
+
+The hooks mirror the same checks that CI runs:
+
+- **pre-commit**: runs `bun run lint` (Biome static analysis)
+- **pre-push**: runs `bun run lint` and `bun run test` (Biome + Vitest)
+
+CI still executes the full suite on every push and pull request — the hooks bring the same feedback earlier, before a push is made.
 
 ## License
 

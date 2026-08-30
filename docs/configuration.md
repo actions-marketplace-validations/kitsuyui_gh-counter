@@ -15,7 +15,7 @@ required, what is optional, and what happens if you omit a field.
 
 | Field | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `version` | No | none | Schema version. `1` is the current value |
+| `version` | No | none | Schema version. If set, it must be `1` |
 | `default_branch` | No | repository default branch | Baseline branch for default-branch pushes |
 | `comment.enabled` | No | `true` | Enables or disables PR comments |
 | `comment.key` | No | `default` | Unique marker key for idempotent comments |
@@ -61,11 +61,29 @@ required, what is optional, and what happens if you omit a field.
 | `matchers[].pattern` | Yes | none | Literal string or regular expression |
 | `matchers[].case_sensitive` | No | `false` | Enables case-sensitive matching |
 
+## Action outputs
+
+The action exposes named step outputs so downstream workflow steps can inspect
+the generated summary, gate on violations, or publish artifacts.
+
+| Output | Meaning |
+| --- | --- |
+| `summary-path` | Path to the generated summary JSON file. |
+| `summary-json` | Full generated summary JSON as a string. |
+| `violation-count` | Number of counters with failing conditions in the current event scope. |
+| `has-violations` | `true` when any counter violated a failing condition in the current event scope; otherwise `false`. |
+| `publish-branch` | Publish branch used for generated assets. |
+
+For example, a workflow can branch on
+`${{ steps.counter.outputs.has-violations }}` or upload
+`${{ steps.counter.outputs.summary-path }}` after the action runs.
+
 ## Top-level behavior
 
 The `version` field exists so that future schema changes can evolve without
 guesswork. It is currently optional, but setting it to `1` is a good habit for
-repositories that want stable automation over time.
+repositories that want stable automation over time. Unknown version values are
+rejected instead of being ignored.
 
 The `default_branch` field is also optional. If it is omitted, `gh-counter`
 uses the repository's configured default branch from the GitHub event payload.
@@ -194,10 +212,11 @@ machine-readable data. Users who only care about README badges can ignore the
 JSON files, while teams that want to build dashboards or secondary tooling can
 consume them directly. `history.json` stores one repository-wide entry per
 published default-branch commit and replaces the entry when the same commit is
-republished on a workflow rerun. The generated report Markdown is designed to be
-the primary click target for badges, and the graph highlights the last
-`publish.graph_days` days with a solid line while retaining older data as a
-dotted line for context.
+republished on a workflow rerun. It keeps the most recent 366 published entries
+so generated branches stay bounded during long-running use. The generated report
+Markdown is designed to be the primary click target for badges, and the graph
+highlights the last `publish.graph_days` days with a solid line while retaining
+older data as a dotted line for context.
 
 In many repositories, the most useful README badge is a linked badge rather
 than a standalone image. The generated SVG can stay in the publish branch, while

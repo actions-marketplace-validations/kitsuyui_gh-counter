@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
+import Ajv from 'ajv'
 import { renderBadge } from './badge'
 import { buildMarker, decideCommentAction, renderComment } from './comment'
 import { mergePublishedHistory } from './history'
@@ -18,6 +19,120 @@ import type {
   PublishedHistory,
   SummaryStatus,
 } from './types'
+
+const ajv = new Ajv()
+
+const validateSummaryStatus = ajv.compile({
+  type: 'object',
+  required: [
+    'generated_at',
+    'repository',
+    'default_branch',
+    'event_name',
+    'base_label',
+    'head_label',
+    'head_reference',
+    'base_only_paths',
+    'counters',
+  ],
+  properties: {
+    generated_at: { type: 'string' },
+    repository: { type: 'string' },
+    default_branch: { type: 'string' },
+    publish_branch: { type: ['string', 'null'] },
+    event_name: { type: 'string' },
+    base_label: { type: 'string' },
+    base_reference: { type: ['string', 'null'] },
+    head_label: { type: 'string' },
+    head_reference: { type: 'string' },
+    bootstrap_message: { type: ['string', 'null'] },
+    base_only_paths: { type: 'array', items: { type: 'string' } },
+    counters: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: [
+          'id',
+          'label',
+          'current',
+          'base',
+          'delta',
+          'dashboard_current',
+          'dashboard_base',
+          'dashboard_delta',
+          'commentable',
+          'touched_files',
+          'file_deltas',
+          'patch_file_deltas',
+          'violations',
+          'badge_path',
+          'counter_path',
+        ],
+        properties: {
+          id: { type: 'string' },
+          label: { type: 'string' },
+          current: { type: 'number' },
+          base: { type: ['number', 'null'] },
+          delta: { type: ['number', 'null'] },
+          dashboard_current: { type: 'number' },
+          dashboard_base: { type: ['number', 'null'] },
+          dashboard_delta: { type: ['number', 'null'] },
+          commentable: { type: 'boolean' },
+          touched_files: { type: 'array' },
+          file_deltas: { type: 'array' },
+          patch_file_deltas: { type: 'array' },
+          violations: { type: 'array' },
+          badge_path: { type: 'string' },
+          counter_path: { type: 'string' },
+        },
+      },
+    },
+  },
+})
+
+const validatePublishedHistory = ajv.compile({
+  type: 'object',
+  required: ['repository', 'default_branch', 'entries'],
+  properties: {
+    repository: { type: 'string' },
+    default_branch: { type: 'string' },
+    entries: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['generated_at', 'head_reference', 'counters'],
+        properties: {
+          generated_at: { type: 'string' },
+          head_reference: { type: 'string' },
+          counters: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['id', 'label', 'count'],
+              properties: {
+                id: { type: 'string' },
+                label: { type: 'string' },
+                count: { type: 'number' },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+})
+
+export function parseSummaryStatus(data: unknown): SummaryStatus | null {
+  if (data === null || data === undefined) return null
+  if (!validateSummaryStatus(data)) return null
+  return data as SummaryStatus
+}
+
+export function parsePublishedHistory(data: unknown): PublishedHistory | null {
+  if (data === null || data === undefined) return null
+  if (!validatePublishedHistory(data)) return null
+  return data as PublishedHistory
+}
 
 type Octokit = ReturnType<typeof github.getOctokit>
 
@@ -105,11 +220,11 @@ export async function updatePullRequestComment(
   }
 }
 
-async function fetchPublishedJson<T>(
+async function fetchPublishedJson(
   octokit: Octokit,
   branch: string,
   filename: string
-): Promise<T | null> {
+): Promise<unknown> {
   try {
     const response = await octokit.rest.repos.getContent({
       ...github.context.repo,
@@ -124,7 +239,7 @@ async function fetchPublishedJson<T>(
     }
     return JSON.parse(
       Buffer.from(response.data.content, 'base64').toString('utf8')
-    ) as T
+    )
   } catch (error) {
     if (isPermissionError(error)) {
       return null
@@ -138,7 +253,16 @@ export async function fetchPublishedSummary(
   branch: string,
   summaryFilename: string
 ): Promise<SummaryStatus | null> {
-  return fetchPublishedJson<SummaryStatus>(octokit, branch, summaryFilename)
+  const data = await fetchPublishedJson(octokit, branch, summaryFilename)
+  const parsed = parseSummaryStatus(data)
+  if (parsed === null && data !== null && data !== undefined) {
+    core.warning(
+      `Published ${summaryFilename} failed schema validation and will be ignored. ` +
+        `This may occur after a schema migration. ` +
+        `Errors: ${JSON.stringify(validateSummaryStatus.errors)}`
+    )
+  }
+  return parsed
 }
 
 export async function fetchPublishedHistory(
@@ -146,7 +270,16 @@ export async function fetchPublishedHistory(
   branch: string,
   historyFilename: string
 ): Promise<PublishedHistory | null> {
-  return fetchPublishedJson<PublishedHistory>(octokit, branch, historyFilename)
+  const data = await fetchPublishedJson(octokit, branch, historyFilename)
+  const parsed = parsePublishedHistory(data)
+  if (parsed === null && data !== null && data !== undefined) {
+    core.warning(
+      `Published ${historyFilename} failed schema validation and will be ignored. ` +
+        `This may occur after a schema migration. ` +
+        `Errors: ${JSON.stringify(validatePublishedHistory.errors)}`
+    )
+  }
+  return parsed
 }
 
 async function ensureBranch(
@@ -194,6 +327,22 @@ export async function publishAssets(
       snapshots,
       existingHistory
     )
+    const publishedSummary: SummaryStatus = {
+      ...summary,
+      counters: summary.counters.map((counter) => ({
+        ...counter,
+        badge_path: path.posix.join(
+          config.publish.directory,
+          config.publish.badges_directory,
+          `${counter.id}.svg`
+        ),
+        counter_path: path.posix.join(
+          config.publish.directory,
+          config.publish.counters_directory,
+          `${counter.id}.json`
+        ),
+      })),
+    }
     const treeEntries = [
       {
         path: path.posix.join(
@@ -202,7 +351,7 @@ export async function publishAssets(
         ),
         mode: '100644' as const,
         type: 'blob' as const,
-        content: `${JSON.stringify(summary, null, 2)}\n`,
+        content: `${JSON.stringify(publishedSummary, null, 2)}\n`,
       },
       {
         path: path.posix.join(
@@ -285,19 +434,29 @@ export async function publishAssets(
       tree: tree.data.sha,
       parents: branchState.commitSha ? [branchState.commitSha] : [],
     })
-    if (branchState.commitSha) {
-      await octokit.rest.git.updateRef({
-        ...github.context.repo,
-        ref: `heads/${branch}`,
-        sha: commit.data.sha,
-        force: true,
-      })
-    } else {
-      await octokit.rest.git.createRef({
-        ...github.context.repo,
-        ref: `refs/heads/${branch}`,
-        sha: commit.data.sha,
-      })
+    try {
+      if (branchState.commitSha) {
+        await octokit.rest.git.updateRef({
+          ...github.context.repo,
+          ref: `heads/${branch}`,
+          sha: commit.data.sha,
+          force: true,
+        })
+      } else {
+        await octokit.rest.git.createRef({
+          ...github.context.repo,
+          ref: `refs/heads/${branch}`,
+          sha: commit.data.sha,
+        })
+      }
+    } catch (refError) {
+      if (!isPermissionError(refError)) {
+        core.warning(
+          `Failed to update ref "${branch}" after creating git objects. ` +
+            `Unreachable objects: tree=${tree.data.sha} commit=${commit.data.sha}`
+        )
+      }
+      throw refError
     }
   } catch (error) {
     if (isPermissionError(error)) {
@@ -319,63 +478,79 @@ export async function writeOutputFiles(
   publishedHistory: PublishedHistory | null = null,
   config: NormalizedConfig | null = null
 ): Promise<void> {
-  await fs.mkdir(outputDir, { recursive: true })
-  await fs.writeFile(
-    path.join(outputDir, 'summary.json'),
-    `${JSON.stringify(summary, null, 2)}\n`,
-    'utf8'
-  )
-  if (publishedHistory) {
+  const tmpDir = `${outputDir}.tmp`
+  await fs.rm(tmpDir, { recursive: true, force: true })
+  await fs.mkdir(tmpDir, { recursive: true })
+  try {
     await fs.writeFile(
-      path.join(outputDir, 'history.json'),
-      `${JSON.stringify(publishedHistory, null, 2)}\n`,
+      path.join(tmpDir, 'summary.json'),
+      `${JSON.stringify(summary, null, 2)}\n`,
       'utf8'
     )
-  }
-  await fs.mkdir(path.join(outputDir, 'badges'), { recursive: true })
-  await fs.mkdir(path.join(outputDir, 'counters'), { recursive: true })
-  if (publishedHistory && config) {
-    await fs.mkdir(path.join(outputDir, 'graphs'), { recursive: true })
-    await fs.mkdir(path.join(outputDir, 'reports'), { recursive: true })
-  }
-
-  for (const counter of counters) {
-    const snapshot = snapshots.find((item) => item.id === counter.id)
-    const counterConfig = counterConfigs.find((item) => item.id === counter.id)
-    if (!snapshot) {
-      continue
+    if (publishedHistory) {
+      await fs.writeFile(
+        path.join(tmpDir, 'history.json'),
+        `${JSON.stringify(publishedHistory, null, 2)}\n`,
+        'utf8'
+      )
     }
-    await fs.writeFile(
-      path.join(outputDir, 'badges', `${counter.id}.svg`),
-      renderBadge(counter, counterConfig?.badge),
-      'utf8'
-    )
-    await fs.writeFile(
-      path.join(outputDir, 'counters', `${counter.id}.json`),
-      `${JSON.stringify(snapshot, null, 2)}\n`,
-      'utf8'
-    )
+    await fs.mkdir(path.join(tmpDir, 'badges'), { recursive: true })
+    await fs.mkdir(path.join(tmpDir, 'counters'), { recursive: true })
     if (publishedHistory && config) {
-      await fs.writeFile(
-        path.join(outputDir, 'graphs', `${counter.id}.svg`),
-        renderCounterGraphSvg(
-          publishedHistory,
-          counter,
-          config.publish.graph_days,
-          counterConfig?.badge
-        ),
-        'utf8'
-      )
-      await fs.writeFile(
-        path.join(outputDir, 'reports', `${counter.id}.md`),
-        `${renderCounterReportMarkdown(
-          publishedHistory,
-          counter,
-          counterConfig,
-          config
-        )}\n`,
-        'utf8'
-      )
+      await fs.mkdir(path.join(tmpDir, 'graphs'), { recursive: true })
+      await fs.mkdir(path.join(tmpDir, 'reports'), { recursive: true })
     }
+
+    for (const counter of counters) {
+      const snapshot = snapshots.find((item) => item.id === counter.id)
+      const counterConfig = counterConfigs.find(
+        (item) => item.id === counter.id
+      )
+      if (!snapshot) {
+        continue
+      }
+      await fs.writeFile(
+        path.join(tmpDir, 'badges', `${counter.id}.svg`),
+        renderBadge(counter, counterConfig?.badge),
+        'utf8'
+      )
+      await fs.writeFile(
+        path.join(tmpDir, 'counters', `${counter.id}.json`),
+        `${JSON.stringify(snapshot, null, 2)}\n`,
+        'utf8'
+      )
+      if (publishedHistory && config) {
+        await fs.writeFile(
+          path.join(tmpDir, 'graphs', `${counter.id}.svg`),
+          renderCounterGraphSvg(
+            publishedHistory,
+            counter,
+            config.publish.graph_days,
+            counterConfig?.badge
+          ),
+          'utf8'
+        )
+        await fs.writeFile(
+          path.join(tmpDir, 'reports', `${counter.id}.md`),
+          `${renderCounterReportMarkdown(
+            publishedHistory,
+            counter,
+            counterConfig,
+            config
+          )}\n`,
+          'utf8'
+        )
+      }
+    }
+    // Atomic replacement: try rename first (works when outputDir is absent);
+    // fall back to removing outputDir then renaming (handles non-empty target).
+    try {
+      await fs.rename(tmpDir, outputDir)
+    } catch {
+      await fs.rm(outputDir, { recursive: true, force: true })
+      await fs.rename(tmpDir, outputDir)
+    }
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
   }
 }

@@ -17,10 +17,14 @@ export const DEFAULT_EXCLUDES = [
   '.gh-counter/**',
 ]
 
-export interface ContentSource {
-  kind: 'workspace' | 'revision'
-  revision?: string
-}
+export type ContentSource =
+  | { kind: 'workspace'; revision?: never }
+  | { kind: 'revision'; revision: string }
+
+export type ReadFileResult =
+  | { kind: 'text'; content: string }
+  | { kind: 'unsupported'; reason: 'binary' }
+  | { kind: 'error'; error: Error }
 
 export function createMatchKey(match: MatchRecord): string {
   return `${match.path}:${match.line}`
@@ -48,7 +52,7 @@ export async function listFiles(source: ContentSource): Promise<string[]> {
     'ls-tree',
     '-r',
     '--name-only',
-    source.revision as string,
+    source.revision,
   ])
   return stdout
     .split('\n')
@@ -63,17 +67,24 @@ export function filterFiles(files: string[], matcher: MatcherConfig): string[] {
   })
 }
 
+function toError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error
+  }
+  return new Error(String(error))
+}
+
 export async function readFile(
   source: ContentSource,
   filePath: string
-): Promise<string | null> {
+): Promise<ReadFileResult> {
   try {
     if (source.kind === 'workspace') {
       const buffer = await fs.readFile(path.resolve(filePath))
       if (buffer.includes(0)) {
-        return null
+        return { kind: 'unsupported', reason: 'binary' }
       }
-      return buffer.toString('utf8')
+      return { kind: 'text', content: buffer.toString('utf8') }
     }
 
     const { stdout } = await execFileAsync(
@@ -85,11 +96,11 @@ export async function readFile(
       }
     )
     if (stdout.includes('\u0000')) {
-      return null
+      return { kind: 'unsupported', reason: 'binary' }
     }
-    return stdout
-  } catch {
-    return null
+    return { kind: 'text', content: stdout }
+  } catch (error) {
+    return { kind: 'error', error: toError(error) }
   }
 }
 
